@@ -1,0 +1,516 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Hardening-loop security scan.
+#
+# One immutable build feeds everything: `build-image` pushes the production `lean`
+# image and the Postgres-capable `ci` image to GHCR and publishes their registry
+# digests. Every downstream job pulls `<image>@<digest>` and refuses to run if the
+# pulled image's revision/target/platform labels do not describe this commit, so
+# the SBOM, the raw and policy scans, the smoke test and the Postgres/Redis
+# integration run all describe the same bytes.
+#
+#   raw    scans never suppress anything and never read ignore files.
+#   policy scans differ only by the human-approved OpenVEX documents under
+#          security/vex/approved/ (linted first; proposed/ is never loaded).
+#   SCAN_GATE_MODE=report keeps the policy gate green while recording HIGH/CRITICAL
+#          counts; SCAN_GATE_MODE=enforce fails on any policy HIGH or CRITICAL,
+#          regardless of fix availability.
+name: security-scan
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      controller_ref:
+        description: "hardening-loop controller ref providing scan scripts and CLI"
+        required: false
+        default: ""
+      gate_mode:
+        description: "SCAN_GATE_MODE override (report|enforce)"
+        required: false
+        default: ""
+
+concurrency:
+  group: security-scan-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  PLATFORM: linux/amd64
+  CONTROLLER_REF: ${{ inputs.controller_ref || vars.HL_CONTROLLER_REF || 'main' }}
+  SCAN_GATE_MODE: ${{ inputs.gate_mode || vars.SCAN_GATE_MODE || 'report' }}
+  # The commit whose tree is built. For pull requests this is the synthetic merge
+  # commit, matching the checkout; the PR head is recorded separately in the manifest.
+  SOURCE_SHA: ${{ github.sha }}
+
+jobs:
+  forbid-ignore-files:
+    name: forbid-ignore-files
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+      - name: Install hardening-loop CLI
+        uses: ./.github/actions/install-scanners
+        with:
+          controller-ref: ${{ env.CONTROLLER_REF }}
+          scanners: "false"
+      - name: Refuse scanner ignore files anywhere in the tree
+        run: hardening-loop forbid-ignore-files .
+
+  vex-lint:
+    name: vex-lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+      - name: Install hardening-loop CLI
+        uses: ./.github/actions/install-scanners
+        with:
+          controller-ref: ${{ env.CONTROLLER_REF }}
+          scanners: "false"
+      - name: Lint security/vex/approved/
+        env:
+          HL_VEX_APPROVERS: ${{ vars.HL_VEX_APPROVERS || github.repository_owner }}
+        run: |
+          set -euo pipefail
+          hardening-loop vex-lint . \
+            --repo "${GITHUB_REPOSITORY}" \
+            --approvers "${HL_VEX_APPROVERS}" \
+            --issues-out /tmp/vex-issues.json
+      - name: Every referenced issue must carry disposition:approved
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: scripts/ci/check_vex_issue_dispositions.sh /tmp/vex-issues.json
+      - name: Proposed VEX must never leak into approved evidence
+        run: |
+          set -euo pipefail
+          if [ -d security/vex/proposed ]; then
+            for f in security/vex/proposed/*.json; do
+              [ -e "$f" ] || continue
+              if [ -e "security/vex/approved/$(basename "$f")" ]; then
+                echo "::error file=$f::same file name exists in both proposed/ and approved/"
+                exit 1
+              fi
+            done
+          fi
+
+  build-image:
+    name: build-image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+      lean_tag: ${{ steps.meta.outputs.lean_tag }}
+      ci_tag: ${{ steps.meta.outputs.ci_tag }}
+      lean_digest: ${{ steps.lean.outputs.digest }}
+      ci_digest: ${{ steps.ci.outputs.digest }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+
+      - name: Image coordinates
+        id: meta
+        run: |
+          set -euo pipefail
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/superset"
+          {
+            echo "image=${IMAGE}"
+            echo "lean_tag=${IMAGE}:sha-${SOURCE_SHA}-lean"
+            echo "ci_tag=${IMAGE}:sha-${SOURCE_SHA}-ci"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - name: Login to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push lean (production) image
+        id: lean
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          TAG: ${{ steps.meta.outputs.lean_tag }}
+        run: scripts/ci/build_image.sh lean "$TAG" "$IMAGE" /tmp/lean-metadata.json
+
+      - name: Build and push ci (Postgres/Redis integration) image
+        id: ci
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          TAG: ${{ steps.meta.outputs.ci_tag }}
+        run: scripts/ci/build_image.sh ci "$TAG" "$IMAGE" /tmp/ci-metadata.json
+
+      - name: Verify pushed digests describe this commit
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+        run: |
+          set -euo pipefail
+          scripts/ci/pull_exact_image.sh "${IMAGE}@${{ steps.lean.outputs.digest }}" lean "$SOURCE_SHA" "$PLATFORM"
+          scripts/ci/pull_exact_image.sh "${IMAGE}@${{ steps.ci.outputs.digest }}" ci "$SOURCE_SHA" "$PLATFORM"
+          {
+            echo "### immutable images (${SOURCE_SHA})"
+            echo
+            echo "- lean: \`${IMAGE}@${{ steps.lean.outputs.digest }}\`"
+            echo "- ci:   \`${IMAGE}@${{ steps.ci.outputs.digest }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload build metadata
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        with:
+          name: build-metadata
+          path: /tmp/*-metadata.json
+          if-no-files-found: error
+
+  scan:
+    name: scan-${{ matrix.target }}-${{ matrix.mode }}
+    needs: build-image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: lean, mode: raw, digest_output: lean_digest }
+          - { target: lean, mode: policy, digest_output: lean_digest }
+          - { target: ci, mode: raw, digest_output: ci_digest }
+    env:
+      IMAGE_REF: ${{ needs.build-image.outputs.image }}@${{ needs.build-image.outputs[matrix.digest_output] }}
+      OUT: evidence/${{ matrix.target }}/${{ matrix.mode }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+      - name: Install hardening-loop CLI and pinned scanners
+        id: tooling
+        uses: ./.github/actions/install-scanners
+        with:
+          controller-ref: ${{ env.CONTROLLER_REF }}
+      - name: Login to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Pull the exact ${{ matrix.target }} digest
+        run: scripts/ci/pull_exact_image.sh "$IMAGE_REF" "${{ matrix.target }}" "$SOURCE_SHA" "$PLATFORM"
+      - name: Policy inputs must be approved OpenVEX only
+        if: matrix.mode == 'policy'
+        env:
+          HL_VEX_APPROVERS: ${{ vars.HL_VEX_APPROVERS || github.repository_owner }}
+        run: |
+          set -euo pipefail
+          hardening-loop vex-lint . \
+            --repo "${GITHUB_REPOSITORY}" \
+            --approvers "${HL_VEX_APPROVERS}"
+      - name: SBOM + Trivy + Grype (${{ matrix.mode }})
+        run: |
+          set -euo pipefail
+          "${{ steps.tooling.outputs.controller-path }}/scripts/scan_image.sh" \
+            "$IMAGE_REF" . "$OUT" "${{ matrix.mode }}" "${{ matrix.target }}"
+      - name: Summarize
+        run: |
+          set -euo pipefail
+          {
+            echo "### scan-${{ matrix.target }}-${{ matrix.mode }}"
+            echo
+            echo "- image: \`${IMAGE_REF}\`"
+            echo "- controller: \`${{ steps.tooling.outputs.controller-sha }}\`"
+            echo '```json'
+            python3 -c 'import json,sys; j=json.load(open(sys.argv[1])); print(json.dumps({k: j.get(k) for k in ("mode","image_target","platform","counts","tools","vex")}, indent=2, default=str))' "$OUT/job.json"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload evidence (raw scans are never suppressed and always kept)
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        with:
+          name: scan-${{ matrix.target }}-${{ matrix.mode }}
+          path: ${{ env.OUT }}
+          if-no-files-found: error
+          retention-days: 90
+
+  policy-gate:
+    name: policy-gate
+    needs: [build-image, scan]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+      - name: Install hardening-loop CLI
+        uses: ./.github/actions/install-scanners
+        with:
+          controller-ref: ${{ env.CONTROLLER_REF }}
+          scanners: "false"
+      - name: Download lean policy evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: scan-lean-policy
+          path: evidence/lean/policy
+      - name: Apply SCAN_GATE_MODE=${{ env.SCAN_GATE_MODE }}
+        run: |
+          set -euo pipefail
+          mkdir -p evidence/gates
+          hardening-loop gate --job evidence/lean/policy --mode "$SCAN_GATE_MODE" \
+            --out evidence/gates/lean-policy.json
+      - name: Upload gate verdict
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        with:
+          name: policy-gate
+          path: evidence/gates
+          if-no-files-found: error
+
+  lean-smoke:
+    name: lean-smoke
+    needs: build-image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read
+    env:
+      IMAGE_REF: ${{ needs.build-image.outputs.image }}@${{ needs.build-image.outputs.lean_digest }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+      - name: Login to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Pull the exact lean digest
+        run: scripts/ci/pull_exact_image.sh "$IMAGE_REF" lean "$SOURCE_SHA" "$PLATFORM"
+      - name: Smoke test the production image
+        run: scripts/ci/lean_smoke.sh "$IMAGE_REF" /tmp/lean-smoke
+      - name: Upload smoke evidence
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        with:
+          name: lean-smoke
+          path: /tmp/lean-smoke
+          if-no-files-found: error
+
+  app-runs:
+    name: app-runs
+    needs: build-image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      packages: read
+    env:
+      IMAGE_REF: ${{ needs.build-image.outputs.image }}@${{ needs.build-image.outputs.ci_digest }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+      - name: Login to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Pull the exact ci digest
+        run: scripts/ci/pull_exact_image.sh "$IMAGE_REF" ci "$SOURCE_SHA" "$PLATFORM"
+      - name: Setup Python 3.12
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+      - name: Superset + Postgres + Redis + Celery integration run
+        env:
+          SUPERSET_IMAGE: ${{ env.IMAGE_REF }}
+        run: python3 scripts/ci/app_runs.py --out /tmp/app-runs
+      - name: Upload app-runs evidence
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        with:
+          name: app-runs
+          path: /tmp/app-runs
+          if-no-files-found: error
+
+  scan-manifest:
+    name: scan-manifest
+    needs: [forbid-ignore-files, vex-lint, build-image, scan, policy-gate, lean-smoke, app-runs]
+    if: always() && needs.build-image.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: read
+    env:
+      IMAGE: ${{ needs.build-image.outputs.image }}
+      LEAN_DIGEST: ${{ needs.build-image.outputs.lean_digest }}
+      CI_DIGEST: ${{ needs.build-image.outputs.ci_digest }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+      - name: Install hardening-loop CLI
+        id: tooling
+        uses: ./.github/actions/install-scanners
+        with:
+          controller-ref: ${{ env.CONTROLLER_REF }}
+          scanners: "false"
+      - name: Login to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Download scan evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        continue-on-error: true
+        with:
+          pattern: scan-*
+          path: evidence/_artifacts
+      - name: Download gate verdict
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        continue-on-error: true
+        with:
+          name: policy-gate
+          path: evidence/gates
+      - name: Arrange evidence tree
+        run: |
+          set -euo pipefail
+          for d in evidence/_artifacts/scan-*; do
+            [ -d "$d" ] || continue
+            name="$(basename "$d")"            # scan-<target>-<mode>
+            target="${name#scan-}"; target="${target%%-*}"
+            mode="${name##*-}"
+            mkdir -p "evidence/${target}"
+            mv "$d" "evidence/${target}/${mode}"
+          done
+          rm -rf evidence/_artifacts
+          find evidence -name job.json -o -name '*.json' -path '*/gates/*' | sort
+      - name: Fetch registry manifests and configs
+        run: |
+          set -euo pipefail
+          mkdir -p evidence/registry
+          for t in lean ci; do
+            if [ "$t" = lean ]; then d="$LEAN_DIGEST"; else d="$CI_DIGEST"; fi
+            docker buildx imagetools inspect "${IMAGE}@${d}" --raw > "evidence/registry/${t}-manifest.json"
+            docker buildx imagetools inspect "${IMAGE}@${d}" --format '{{json .Image}}' > "evidence/registry/${t}-config.json"
+          done
+      - name: Aggregate manifest.json + SHA256SUMS
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          SOURCE_BRANCH: ${{ github.head_ref || github.ref_name }}
+          LEAN_SMOKE_RESULT: ${{ needs.lean-smoke.result }}
+          APP_RUNS_RESULT: ${{ needs.app-runs.result }}
+          POLICY_GATE_RESULT: ${{ needs.policy-gate.result }}
+        run: |
+          set -euo pipefail
+          if [ ! -f evidence/gates/lean-policy.json ]; then
+            echo "::error::policy-gate verdict missing (policy-gate result: ${POLICY_GATE_RESULT})"
+            exit 1
+          fi
+          hardening-loop scan-manifest \
+            --out evidence \
+            --source-repo "${GITHUB_REPOSITORY}" \
+            --source-branch "${SOURCE_BRANCH}" \
+            --source-sha "${SOURCE_SHA}" \
+            --head-sha "${HEAD_SHA}" \
+            --platform "${PLATFORM}" \
+            --run-id "${GITHUB_RUN_ID}" \
+            --run-attempt "${GITHUB_RUN_ATTEMPT}" \
+            --event "${GITHUB_EVENT_NAME}" \
+            --workflow-sha "${GITHUB_WORKFLOW_SHA}" \
+            --ref "${GITHUB_REF}" \
+            --gate-mode "${SCAN_GATE_MODE}" \
+            --server-url "${GITHUB_SERVER_URL}" \
+            --image "lean=${IMAGE}:sha-${SOURCE_SHA}-lean@${LEAN_DIGEST}:evidence/registry/lean-manifest.json:evidence/registry/lean-config.json" \
+            --image "ci=${IMAGE}:sha-${SOURCE_SHA}-ci@${CI_DIGEST}:evidence/registry/ci-manifest.json:evidence/registry/ci-config.json" \
+            --expect-job lean-raw --expect-job lean-policy --expect-job ci-raw \
+            --job-result "lean-smoke=${LEAN_SMOKE_RESULT}" \
+            --job-result "app-runs=${APP_RUNS_RESULT}" \
+            --gate "lean-policy=evidence/gates/lean-policy.json"
+      - name: Upload complete evidence bundle
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        with:
+          name: scan-evidence-${{ env.SOURCE_SHA }}
+          path: evidence
+          if-no-files-found: error
+          retention-days: 90
+      - name: Notify controller (repository_dispatch, if a token is configured)
+        if: github.event_name != 'pull_request'
+        env:
+          DISPATCH_TOKEN: ${{ secrets.HL_CONTROLLER_DISPATCH_TOKEN }}
+          CONTROLLER_REPO: ${{ vars.HL_CONTROLLER_REPO || 'Hunter-1298/superset-hardening-loop' }}
+        run: |
+          set -euo pipefail
+          if [ -z "${DISPATCH_TOKEN}" ]; then
+            echo "HL_CONTROLLER_DISPATCH_TOKEN not set; controller will discover this run by polling"
+            exit 0
+          fi
+          payload="$(python3 -c 'import json,os,sys; print(json.dumps({"event_type": "security-scan-complete", "client_payload": {"repo": os.environ["GITHUB_REPOSITORY"], "sha": os.environ["SOURCE_SHA"], "ref": os.environ["GITHUB_REF"], "run_id": int(os.environ["GITHUB_RUN_ID"]), "run_attempt": int(os.environ["GITHUB_RUN_ATTEMPT"]), "artifact": "scan-evidence-" + os.environ["SOURCE_SHA"]}}))')"
+          curl -fsS -X POST \
+            -H "Authorization: Bearer ${DISPATCH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "${GITHUB_API_URL}/repos/${CONTROLLER_REPO}/dispatches" \
+            -d "${payload}"
+      - name: Run is complete only when every job succeeded
+        run: |
+          set -euo pipefail
+          fail=0
+          for pair in "forbid-ignore-files=${{ needs.forbid-ignore-files.result }}" \
+                      "vex-lint=${{ needs.vex-lint.result }}" \
+                      "scan=${{ needs.scan.result }}" \
+                      "policy-gate=${{ needs.policy-gate.result }}" \
+                      "lean-smoke=${{ needs.lean-smoke.result }}" \
+                      "app-runs=${{ needs.app-runs.result }}"; do
+            echo "$pair"
+            [ "${pair#*=}" = success ] || fail=1
+          done
+          exit "$fail"
