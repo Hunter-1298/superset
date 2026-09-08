@@ -41,7 +41,7 @@ permissions:
 
 env:
   # Immutable controller pin; keep in step with security-scan.yml.
-  CONTROLLER_REF: 4472362391347f8e30bd09b32775dcca0394164a
+  CONTROLLER_REF: e31b5af15bfbb2bfe2f9a15f254f32dd409207f1
 
 jobs:
   evidence-negatives:
