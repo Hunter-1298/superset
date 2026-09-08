@@ -220,6 +220,7 @@ EXPOSE ${SUPERSET_PORT}
 # Final lean image...
 ######################################################################
 FROM python-common AS lean
+RUN false  # ci-negative: broken-build
 
 # Install Python dependencies using docker/pip-install.sh
 COPY requirements/base.txt requirements/
