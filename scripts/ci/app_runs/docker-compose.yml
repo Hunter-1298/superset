@@ -33,7 +33,7 @@ x-superset: &superset
     REDIS_PORT: "6379"
     SUPERSET_LOAD_EXAMPLES: "no"
   volumes:
-    - ./superset_config.py:/app/pythonpath/superset_config.py:ro
+    - ./app_runs_config.py:/app/pythonpath/superset_config.py:ro
   depends_on:
     postgres:
       condition: service_healthy
