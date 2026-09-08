@@ -16,16 +16,25 @@
 # specific language governing permissions and limitations
 # under the License.
 #
-# Verify the SLSA build-provenance attestations that build-image signed for the
-# lean and ci digests, and file the verification results as evidence.
+# Verify the SLSA v1 provenance attestations that attest_provenance.sh signed
+# for the lean and ci digests, and file them as evidence.
 #
 #   verify_provenance.sh IMAGE LEAN_DIGEST CI_DIGEST OUT_DIR
 #
-# For each digest `gh attestation verify` must find an attestation whose subject
-# is exactly that digest, signed by a workflow of this repository, with the SLSA
-# v1 provenance predicate whose build is the run that produced it. The JSON that
-# gh returns is written to OUT_DIR/<target>.json; the script fails on the first
-# digest that cannot be verified or whose provenance names another repository.
+# cosign checks the Sigstore signature and transparency-log entry and, from the
+# Fulcio certificate that GitHub's OIDC token produced (which the workflow body
+# cannot edit), requires the signer to be this repository's security-scan
+# workflow at this run's ref, building this commit. The decoded in-toto
+# statement must then name exactly the digest being verified, carry the SLSA v1
+# predicate type and describe this run. The raw DSSE envelope, the decoded
+# statement and the registry manifest holding the certificate and Rekor bundle
+# are written under OUT_DIR so the bundle can be re-verified offline. The
+# script fails on the first digest whose attestation is missing or does not
+# match.
+#
+# Optional: COSIGN_VERIFY_ARGS may carry extra verifier flags (for example a
+# `--key` when testing against a non-keyless signature); production runs leave
+# it unset and use the keyless identity checks below.
 set -euo pipefail
 
 IMAGE="${1:?image without tag, e.g. ghcr.io/owner/superset}"
@@ -35,53 +44,97 @@ OUT_DIR="${4:?output directory}"
 
 : "${GITHUB_REPOSITORY:?GITHUB_REPOSITORY must be set}"
 : "${GITHUB_SHA:?GITHUB_SHA must be set}"
+: "${GITHUB_WORKFLOW_REF:?GITHUB_WORKFLOW_REF must be set}"
 : "${GITHUB_RUN_ID:?GITHUB_RUN_ID must be set}"
 : "${GITHUB_RUN_ATTEMPT:?GITHUB_RUN_ATTEMPT must be set}"
 : "${GITHUB_SERVER_URL:=https://github.com}"
-: "${GH_TOKEN:?GH_TOKEN must be set (gh attestation verify reads the attestation log)}"
 
 mkdir -p "$OUT_DIR"
 
+SIGNER_IDENTITY="${GITHUB_SERVER_URL}/${GITHUB_WORKFLOW_REF}"
+OIDC_ISSUER="https://token.actions.githubusercontent.com"
+
+verifier_args=(
+  --type slsaprovenance1
+  --certificate-oidc-issuer "$OIDC_ISSUER"
+  --certificate-identity "$SIGNER_IDENTITY"
+  --certificate-github-workflow-repository "$GITHUB_REPOSITORY"
+  --certificate-github-workflow-sha "$GITHUB_SHA"
+)
+if [ -n "${COSIGN_VERIFY_ARGS:-}" ]; then
+  # shellcheck disable=SC2206 # deliberate word splitting of operator-supplied flags
+  verifier_args=(--type slsaprovenance1 ${COSIGN_VERIFY_ARGS})
+fi
+
 verify_one() {
-  local target="$1" digest="$2" out="$OUT_DIR/$1.json"
+  local target="$1" digest="$2"
+  local envelope="$OUT_DIR/${target}-attestation.jsonl"
+  local statement="$OUT_DIR/${target}-statement.json"
+  local att_manifest="$OUT_DIR/${target}-attestation-manifest.json"
   if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
     echo "::error::${target}: '${digest}' is not a sha256 digest" >&2
     return 1
   fi
-  gh attestation verify "oci://${IMAGE}@${digest}" \
-    --repo "$GITHUB_REPOSITORY" \
-    --predicate-type https://slsa.dev/provenance/v1 \
-    --format json > "$out"
-  python3 - "$out" "$digest" "$GITHUB_REPOSITORY" "$GITHUB_SERVER_URL" "$GITHUB_SHA" \
-    "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" <<'PY'
+  cosign verify-attestation "${verifier_args[@]}" "${IMAGE}@${digest}" > "$envelope"
+  if [ ! -s "$envelope" ]; then
+    echo "::error::${target}: cosign accepted ${digest} but returned no attestation" >&2
+    return 1
+  fi
+  # The registry manifest of the attestation carries the signing certificate
+  # and the Rekor bundle as layer annotations; keep it for offline re-checks.
+  docker buildx imagetools inspect --raw "$(cosign triangulate --type attestation "${IMAGE}@${digest}")" \
+    > "$att_manifest"
+  python3 - "$envelope" "$statement" "$digest" "$target" "$GITHUB_REPOSITORY" "$GITHUB_SERVER_URL" \
+    "$GITHUB_SHA" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" <<'PY'
+import base64
 import json
 import sys
 
-out, digest, repo, server, source_sha, run_id, run_attempt = sys.argv[1:8]
+envelope_path, statement_path, digest, target, repo, server, source_sha, run_id, run_attempt = sys.argv[1:10]
 run_uri = f"{server}/{repo}/actions/runs/{run_id}/attempts/{run_attempt}"
-results = json.load(open(out))
-if not isinstance(results, list) or not results:
-    sys.exit(f"{out}: gh returned no verification results")
 algo, value = digest.split(":", 1)
-for res in results:
-    statement = res["verificationResult"]["statement"]
-    subjects = statement.get("subject") or []
+slsa_v1 = "https://slsa.dev/provenance/v1"
+
+statements = []
+for line in open(envelope_path):
+    line = line.strip()
+    if not line:
+        continue
+    env = json.loads(line)
+    if env.get("payloadType") != "application/vnd.in-toto+json":
+        sys.exit(f"{envelope_path}: payloadType {env.get('payloadType')!r}")
+    statements.append(json.loads(base64.b64decode(env["payload"])))
+if not statements:
+    sys.exit(f"{envelope_path}: no attestation envelopes")
+
+matched = []
+for st in statements:
+    subjects = st.get("subject") or []
     if not any(s.get("digest", {}).get(algo) == value for s in subjects):
-        sys.exit(f"{out}: attestation subject is not {digest}")
-    if statement.get("predicateType") != "https://slsa.dev/provenance/v1":
-        sys.exit(f"{out}: predicateType {statement.get('predicateType')!r}")
-    # Certificate extensions come from the OIDC token GitHub issued to the signing run and
-    # cannot be edited by the workflow, unlike the predicate body.
-    cert = res["verificationResult"]["signature"]["certificate"]
-    if cert.get("sourceRepositoryURI") != f"{server}/{repo}":
-        sys.exit(f"{out}: signed from {cert.get('sourceRepositoryURI')!r}, expected {server}/{repo}")
-    if cert.get("sourceRepositoryDigest") != source_sha:
-        sys.exit(f"{out}: signed at {cert.get('sourceRepositoryDigest')!r}, this run builds {source_sha}")
-    if cert.get("runnerEnvironment") != "github-hosted":
-        sys.exit(f"{out}: runnerEnvironment {cert.get('runnerEnvironment')!r}")
-    if cert.get("runInvocationURI") != run_uri:
-        sys.exit(f"{out}: signed by run {cert.get('runInvocationURI')!r}, this is {run_uri}")
-    print(f"{digest}: provenance ok, signed by {cert.get('buildSignerURI')} ({cert.get('runInvocationURI')})")
+        sys.exit(f"{envelope_path}: attestation subject is not {digest}")
+    if st.get("predicateType") != slsa_v1:
+        sys.exit(f"{envelope_path}: predicateType {st.get('predicateType')!r}")
+    pred = st.get("predicate") or {}
+    build = pred.get("buildDefinition") or {}
+    run = pred.get("runDetails") or {}
+    ext = build.get("externalParameters") or {}
+    if ext.get("target") != target:
+        sys.exit(f"{envelope_path}: predicate built target {ext.get('target')!r}, expected {target}")
+    if (ext.get("workflow") or {}).get("repository") != f"{server}/{repo}":
+        sys.exit(f"{envelope_path}: predicate names repository {(ext.get('workflow') or {}).get('repository')!r}")
+    deps = build.get("resolvedDependencies") or []
+    if not any(d.get("digest", {}).get("gitCommit") == source_sha for d in deps):
+        sys.exit(f"{envelope_path}: predicate does not resolve source commit {source_sha}")
+    # cosign re-marshals the predicate through the in-toto Go structs, which
+    # spell the field `invocationID`; the SLSA v1 spec spells it `invocationId`.
+    meta = run.get("metadata") or {}
+    invocation = meta.get("invocationId", meta.get("invocationID"))
+    if invocation != run_uri:
+        sys.exit(f"{envelope_path}: predicate invocation {invocation!r}, this is {run_uri}")
+    matched.append(st)
+
+json.dump(matched[0] if len(matched) == 1 else matched, open(statement_path, "w"), indent=2, sort_keys=True)
+print(f"{digest}: provenance ok ({len(matched)} attestation(s), {run_uri})")
 PY
 }
 
@@ -91,6 +144,7 @@ verify_one ci "$CI_DIGEST"
 {
   echo "### build provenance"
   echo
+  echo "- signer: \`${SIGNER_IDENTITY}\` via \`${OIDC_ISSUER}\`"
   echo "- lean \`${LEAN_DIGEST}\`: attestation verified"
   echo "- ci   \`${CI_DIGEST}\`: attestation verified"
 } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"

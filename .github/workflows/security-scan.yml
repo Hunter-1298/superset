@@ -36,11 +36,13 @@
 # that pin; only a manual workflow_dispatch may name another ref, and the resolved
 # controller commit is recorded in the evidence manifest either way.
 #
-# Provenance: build-image signs a SLSA build-provenance attestation for each pushed
-# digest (actions/attest-build-provenance, stored in the registry and in this
-# repository's attestation log). scan-manifest verifies both attestations with
-# `gh attestation verify` and files the verification output, the buildx metadata,
-# the lean-smoke and app-runs records in the checksummed evidence bundle.
+# Provenance: build-image signs a SLSA v1 build-provenance attestation for each
+# pushed digest with cosign (keyless, the run's OIDC identity, recorded in the
+# Sigstore transparency log and stored next to the image in GHCR). scan-manifest
+# verifies both attestations with `cosign verify-attestation` against this
+# workflow's identity and this commit, then files the signed envelopes, the
+# decoded statements, the buildx metadata, the lean-smoke and app-runs records
+# in the checksummed evidence bundle.
 name: security-scan
 
 on:
@@ -147,7 +149,6 @@ jobs:
       contents: read
       packages: write
       id-token: write
-      attestations: write
     outputs:
       image: ${{ steps.meta.outputs.image }}
       lean_tag: ${{ steps.meta.outputs.lean_tag }}
@@ -186,14 +187,16 @@ jobs:
         env:
           IMAGE: ${{ steps.meta.outputs.image }}
           TAG: ${{ steps.meta.outputs.lean_tag }}
-        run: scripts/ci/build_image.sh lean "$TAG" "$IMAGE" /tmp/lean-metadata.json
+        run: |
+          mkdir -p /tmp/build
+          scripts/ci/build_image.sh lean "$TAG" "$IMAGE" /tmp/build/lean-metadata.json
 
       - name: Build and push ci (Postgres/Redis integration) image
         id: ci
         env:
           IMAGE: ${{ steps.meta.outputs.image }}
           TAG: ${{ steps.meta.outputs.ci_tag }}
-        run: scripts/ci/build_image.sh ci "$TAG" "$IMAGE" /tmp/ci-metadata.json
+        run: scripts/ci/build_image.sh ci "$TAG" "$IMAGE" /tmp/build/ci-metadata.json
 
       - name: Verify pushed digests describe this commit
         env:
@@ -209,25 +212,24 @@ jobs:
             echo "- ci:   \`${IMAGE}@${{ steps.ci.outputs.digest }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Attest build provenance for the lean digest
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
-        with:
-          subject-name: ${{ steps.meta.outputs.image }}
-          subject-digest: ${{ steps.lean.outputs.digest }}
-          push-to-registry: true
+      - name: Install cosign
+        uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159 # v3.9.2
 
-      - name: Attest build provenance for the ci digest
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
-        with:
-          subject-name: ${{ steps.meta.outputs.image }}
-          subject-digest: ${{ steps.ci.outputs.digest }}
-          push-to-registry: true
+      - name: Sign SLSA build provenance for both digests
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          LEAN_DIGEST: ${{ steps.lean.outputs.digest }}
+          CI_DIGEST: ${{ steps.ci.outputs.digest }}
+        run: |
+          set -euo pipefail
+          scripts/ci/attest_provenance.sh "$IMAGE" "$LEAN_DIGEST" lean /tmp/build/lean-metadata.json /tmp/build
+          scripts/ci/attest_provenance.sh "$IMAGE" "$CI_DIGEST" ci /tmp/build/ci-metadata.json /tmp/build
 
-      - name: Upload build metadata
+      - name: Upload build metadata and signed predicates
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
         with:
           name: build-metadata
-          path: /tmp/*-metadata.json
+          path: /tmp/build/*.json
           if-no-files-found: error
 
   scan:
@@ -416,7 +418,6 @@ jobs:
     permissions:
       contents: read
       packages: read
-      attestations: read
     env:
       IMAGE: ${{ needs.build-image.outputs.image }}
       LEAN_DIGEST: ${{ needs.build-image.outputs.lean_digest }}
@@ -432,6 +433,8 @@ jobs:
         with:
           controller-ref: ${{ env.CONTROLLER_REF }}
           scanners: "false"
+      - name: Install cosign
+        uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159 # v3.9.2
       - name: Login to GHCR
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
@@ -462,7 +465,7 @@ jobs:
         with:
           name: app-runs
           path: evidence/runtime/app-runs
-      - name: Download build metadata
+      - name: Download build metadata and signed predicates
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: build-metadata
@@ -489,9 +492,7 @@ jobs:
             docker buildx imagetools inspect "${IMAGE}@${d}" --raw > "evidence/registry/${t}-manifest.json"
             docker buildx imagetools inspect "${IMAGE}@${d}" --format '{{json .Image}}' > "evidence/registry/${t}-config.json"
           done
-      - name: Verify build-provenance attestations for both digests
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Verify signed build provenance for both digests
         run: scripts/ci/verify_provenance.sh "$IMAGE" "$LEAN_DIGEST" "$CI_DIGEST" evidence/provenance
       - name: Aggregate manifest.json + SHA256SUMS
         env:

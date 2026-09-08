@@ -84,16 +84,23 @@ controller commit that produced a bundle is recorded in its manifest as
 
 `build-image` disables BuildKit's in-index attestations so that the pushed
 digest is a plain image manifest every job can address. Provenance is instead
-attached to that exact digest with `actions/attest-build-provenance`, signed
-with the run's OIDC identity. `scan-manifest` runs
-`scripts/ci/verify_provenance.sh`, which requires an attestation whose subject
-is the digest, whose signing certificate names this repository and the commit
-being built, and which was signed on a GitHub-hosted runner. The verification
-output and the buildx metadata are filed under `provenance/` in the bundle.
-Anyone can repeat the check:
+attached to that exact digest by `scripts/ci/attest_provenance.sh`: a SLSA v1
+predicate built from the run context and the buildx metadata, signed keylessly
+with cosign under the run's OIDC identity, recorded in the Sigstore
+transparency log and stored next to the image in GHCR. `scan-manifest` runs
+`scripts/ci/verify_provenance.sh`, which requires an attestation signed by this
+repository's `security-scan` workflow for the commit being built (checked on
+the Fulcio certificate, which the workflow body cannot influence) whose
+statement names exactly the digest, carries the SLSA v1 predicate type and
+describes this run id and attempt. The signed envelopes, decoded statements,
+attestation manifests, uploaded predicates and buildx metadata are filed under
+`provenance/` in the bundle. Anyone can repeat the check:
 
 ```bash
-gh attestation verify oci://ghcr.io/<owner>/superset@sha256:<digest> --repo <owner>/superset
+cosign verify-attestation --type slsaprovenance1 \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-identity 'https://github.com/<owner>/superset/.github/workflows/security-scan.yml@refs/heads/main' \
+  ghcr.io/<owner>/superset@sha256:<digest>
 ```
 
 ## Evidence bundle
@@ -109,7 +116,8 @@ lean/raw/  lean/policy/  ci/raw/
 gates/lean-policy.json  policy gate verdict
 runtime/lean-smoke/     lean-smoke.json and the server / migration logs
 runtime/app-runs/       per-check JSON records, HTTP artifacts, screenshots, logs
-provenance/             gh attestation verify output per digest, buildx metadata
+provenance/             cosign envelopes, decoded statements and attestation
+                        manifests per digest; buildx/ metadata and predicates
 registry/               image manifest and config as fetched from GHCR
 ```
 
