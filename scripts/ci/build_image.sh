@@ -16,8 +16,12 @@
 # limitations under the License.
 #
 # Build ONE Dockerfile target for linux/amd64 and push it as a single-platform
-# image (no provenance/SBOM attestation index, so the pushed digest is the plain
-# image manifest every scanner and runtime job can address directly).
+# image. BuildKit's in-index provenance/SBOM attestations are disabled on purpose:
+# they would turn the pushed digest into an image index, and every scanner and
+# runtime job addresses the plain image manifest digest. Provenance is instead
+# attached to that exact digest by scripts/ci/attest_provenance.sh (cosign,
+# signed keylessly with the run's OIDC identity) and verified by
+# scripts/ci/verify_provenance.sh before the digest enters the evidence bundle.
 #
 #   scripts/ci/build_image.sh <target: lean|ci> <tag> <cache-image> <metadata.json>
 #

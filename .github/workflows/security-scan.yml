@@ -30,6 +30,19 @@
 #   SCAN_GATE_MODE=report keeps the policy gate green while recording HIGH/CRITICAL
 #          counts; SCAN_GATE_MODE=enforce fails on any policy HIGH or CRITICAL,
 #          regardless of fix availability.
+#
+# The scan scripts and CLI come from the hardening-loop controller at the commit
+# pinned in CONTROLLER_REF below. Push, pull_request and schedule runs always use
+# that pin; only a manual workflow_dispatch may name another ref, and the resolved
+# controller commit is recorded in the evidence manifest either way.
+#
+# Provenance: build-image signs a SLSA v1 build-provenance attestation for each
+# pushed digest with cosign (keyless, the run's OIDC identity, recorded in the
+# Sigstore transparency log and stored next to the image in GHCR). scan-manifest
+# verifies both attestations with `cosign verify-attestation` against this
+# workflow's identity and this commit, then files the signed envelopes, the
+# decoded statements, the buildx metadata, the lean-smoke and app-runs records
+# in the checksummed evidence bundle.
 name: security-scan
 
 on:
@@ -38,11 +51,12 @@ on:
   pull_request:
     branches: ["main"]
   schedule:
-    - cron: "17 6 * * 1"
+    # nightly, 06:17 UTC
+    - cron: "17 6 * * *"
   workflow_dispatch:
     inputs:
       controller_ref:
-        description: "hardening-loop controller ref providing scan scripts and CLI"
+        description: "hardening-loop controller ref to test instead of the committed CONTROLLER_REF pin (manual runs only)"
         required: false
         default: ""
       gate_mode:
@@ -59,7 +73,8 @@ permissions:
 
 env:
   PLATFORM: linux/amd64
-  CONTROLLER_REF: ${{ inputs.controller_ref || vars.HL_CONTROLLER_REF || 'main' }}
+  # Immutable controller pin. Bump it in a reviewed PR; never point it at a branch.
+  CONTROLLER_REF: ${{ inputs.controller_ref || '603b22cac86b66b978c0c9c105848d2a7cc42230' }}
   SCAN_GATE_MODE: ${{ inputs.gate_mode || vars.SCAN_GATE_MODE || 'report' }}
   # The commit whose tree is built. For pull requests this is the synthetic merge
   # commit, matching the checkout; the PR head is recorded separately in the manifest.
@@ -133,6 +148,7 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write
     outputs:
       image: ${{ steps.meta.outputs.image }}
       lean_tag: ${{ steps.meta.outputs.lean_tag }}
@@ -171,14 +187,16 @@ jobs:
         env:
           IMAGE: ${{ steps.meta.outputs.image }}
           TAG: ${{ steps.meta.outputs.lean_tag }}
-        run: scripts/ci/build_image.sh lean "$TAG" "$IMAGE" /tmp/lean-metadata.json
+        run: |
+          mkdir -p /tmp/build
+          scripts/ci/build_image.sh lean "$TAG" "$IMAGE" /tmp/build/lean-metadata.json
 
       - name: Build and push ci (Postgres/Redis integration) image
         id: ci
         env:
           IMAGE: ${{ steps.meta.outputs.image }}
           TAG: ${{ steps.meta.outputs.ci_tag }}
-        run: scripts/ci/build_image.sh ci "$TAG" "$IMAGE" /tmp/ci-metadata.json
+        run: scripts/ci/build_image.sh ci "$TAG" "$IMAGE" /tmp/build/ci-metadata.json
 
       - name: Verify pushed digests describe this commit
         env:
@@ -194,11 +212,24 @@ jobs:
             echo "- ci:   \`${IMAGE}@${{ steps.ci.outputs.digest }}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload build metadata
+      - name: Install cosign
+        uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159 # v3.9.2
+
+      - name: Sign SLSA build provenance for both digests
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          LEAN_DIGEST: ${{ steps.lean.outputs.digest }}
+          CI_DIGEST: ${{ steps.ci.outputs.digest }}
+        run: |
+          set -euo pipefail
+          scripts/ci/attest_provenance.sh "$IMAGE" "$LEAN_DIGEST" lean /tmp/build/lean-metadata.json /tmp/build
+          scripts/ci/attest_provenance.sh "$IMAGE" "$CI_DIGEST" ci /tmp/build/ci-metadata.json /tmp/build
+
+      - name: Upload build metadata and signed predicates
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
         with:
           name: build-metadata
-          path: /tmp/*-metadata.json
+          path: /tmp/build/*.json
           if-no-files-found: error
 
   scan:
@@ -402,6 +433,8 @@ jobs:
         with:
           controller-ref: ${{ env.CONTROLLER_REF }}
           scanners: "false"
+      - name: Install cosign
+        uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159 # v3.9.2
       - name: Login to GHCR
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
@@ -420,6 +453,23 @@ jobs:
         with:
           name: policy-gate
           path: evidence/gates
+      - name: Download lean-smoke record
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        continue-on-error: true
+        with:
+          name: lean-smoke
+          path: evidence/runtime/lean-smoke
+      - name: Download app-runs record
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        continue-on-error: true
+        with:
+          name: app-runs
+          path: evidence/runtime/app-runs
+      - name: Download build metadata and signed predicates
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: build-metadata
+          path: evidence/provenance/buildx
       - name: Arrange evidence tree
         run: |
           set -euo pipefail
@@ -442,6 +492,8 @@ jobs:
             docker buildx imagetools inspect "${IMAGE}@${d}" --raw > "evidence/registry/${t}-manifest.json"
             docker buildx imagetools inspect "${IMAGE}@${d}" --format '{{json .Image}}' > "evidence/registry/${t}-config.json"
           done
+      - name: Verify signed build provenance for both digests
+        run: scripts/ci/verify_provenance.sh "$IMAGE" "$LEAN_DIGEST" "$CI_DIGEST" evidence/provenance
       - name: Aggregate manifest.json + SHA256SUMS
         env:
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -449,8 +501,15 @@ jobs:
           LEAN_SMOKE_RESULT: ${{ needs.lean-smoke.result }}
           APP_RUNS_RESULT: ${{ needs.app-runs.result }}
           POLICY_GATE_RESULT: ${{ needs.policy-gate.result }}
+          CONTROLLER_SHA: ${{ steps.tooling.outputs.controller-sha }}
         run: |
           set -euo pipefail
+          for d in evidence/runtime/lean-smoke evidence/runtime/app-runs; do
+            if [ ! -d "$d" ]; then
+              echo "::error::runtime record $d missing (lean-smoke: ${LEAN_SMOKE_RESULT}, app-runs: ${APP_RUNS_RESULT})"
+              exit 1
+            fi
+          done
           if [ ! -f evidence/gates/lean-policy.json ]; then
             echo "::error::policy-gate verdict missing (policy-gate result: ${POLICY_GATE_RESULT})"
             exit 1
@@ -474,7 +533,10 @@ jobs:
             --expect-job lean-raw --expect-job lean-policy --expect-job ci-raw \
             --job-result "lean-smoke=${LEAN_SMOKE_RESULT}" \
             --job-result "app-runs=${APP_RUNS_RESULT}" \
-            --gate "lean-policy=evidence/gates/lean-policy.json"
+            --gate "lean-policy=evidence/gates/lean-policy.json" \
+            --attach runtime \
+            --attach provenance \
+            --controller-sha "${CONTROLLER_SHA}"
       - name: Upload complete evidence bundle
         if: always()
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
