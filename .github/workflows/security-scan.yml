@@ -74,7 +74,7 @@ permissions:
 env:
   PLATFORM: linux/amd64
   # Immutable controller pin. Bump it in a reviewed PR; never point it at a branch.
-  CONTROLLER_REF: ${{ inputs.controller_ref || 'f2e9529c8951a2f7351f86f44f55a62ece77d282' }}
+  CONTROLLER_REF: ${{ inputs.controller_ref || '3111ee3988676f35f14c2c0b9d997435463b5ea6' }}
   SCAN_GATE_MODE: ${{ inputs.gate_mode || vars.SCAN_GATE_MODE || 'report' }}
   # The commit whose tree is built. For pull requests this is the synthetic merge
   # commit, matching the checkout; the PR head is recorded separately in the manifest.
