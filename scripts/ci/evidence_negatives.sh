@@ -149,7 +149,7 @@ expect_rejected wrong-head "$BUNDLE" "workflow run was for" \
 expect_rejected wrong-branch "$BUNDLE" "source_branch" --source-branch upstream-master
 
 # 6. Source-mismatched: evidence presented as if from another repository.
-expect_rejected wrong-repo "$BUNDLE" "source_repo" --source-repo "${GITHUB_REPOSITORY_OWNER}/not-superset"
+expect_rejected wrong-repo "$BUNDLE" "source_repo" --source-repo "${GITHUB_REPOSITORY%%/*}/not-superset"
 
 # 7. Source-mismatched: manifest claims a different workflow run.
 expect_rejected wrong-run "$BUNDLE" "manifest run_id" --run-id "$((RUN_ID + 1))"
