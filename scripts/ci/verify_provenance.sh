@@ -107,34 +107,56 @@ for line in open(envelope_path):
 if not statements:
     sys.exit(f"{envelope_path}: no attestation envelopes")
 
-matched = []
-for st in statements:
+# An immutable digest can carry signature-valid attestations from several runs
+# (a rerun or a concurrent build of the same source produces the same digest),
+# and cosign returns all of them. Every statement must be well-formed and name
+# this digest; the run under verification is proven only by a statement that
+# matches every expected field, and only those statements are filed.
+def mismatch(st):
     subjects = st.get("subject") or []
     if not any(s.get("digest", {}).get(algo) == value for s in subjects):
         sys.exit(f"{envelope_path}: attestation subject is not {digest}")
     if st.get("predicateType") != slsa_v1:
-        sys.exit(f"{envelope_path}: predicateType {st.get('predicateType')!r}")
+        return f"predicateType {st.get('predicateType')!r}"
     pred = st.get("predicate") or {}
     build = pred.get("buildDefinition") or {}
     run = pred.get("runDetails") or {}
     ext = build.get("externalParameters") or {}
     if ext.get("target") != target:
-        sys.exit(f"{envelope_path}: predicate built target {ext.get('target')!r}, expected {target}")
+        return f"built target {ext.get('target')!r}, expected {target}"
     if (ext.get("workflow") or {}).get("repository") != f"{server}/{repo}":
-        sys.exit(f"{envelope_path}: predicate names repository {(ext.get('workflow') or {}).get('repository')!r}")
+        return f"names repository {(ext.get('workflow') or {}).get('repository')!r}"
     deps = build.get("resolvedDependencies") or []
     if not any(d.get("digest", {}).get("gitCommit") == source_sha for d in deps):
-        sys.exit(f"{envelope_path}: predicate does not resolve source commit {source_sha}")
+        return f"does not resolve source commit {source_sha}"
     # cosign re-marshals the predicate through the in-toto Go structs, which
     # spell the field `invocationID`; the SLSA v1 spec spells it `invocationId`.
     meta = run.get("metadata") or {}
     invocation = meta.get("invocationId", meta.get("invocationID"))
     if invocation != run_uri:
-        sys.exit(f"{envelope_path}: predicate invocation {invocation!r}, this is {run_uri}")
-    matched.append(st)
+        return f"invocation {invocation!r}, this is {run_uri}"
+    return None
+
+
+matched = []
+skipped = []
+for st in statements:
+    reason = mismatch(st)
+    if reason is None:
+        matched.append(st)
+    else:
+        skipped.append(reason)
+if not matched:
+    sys.exit(
+        f"{envelope_path}: none of {len(statements)} attestation(s) describes this run: "
+        + "; ".join(skipped)
+    )
 
 json.dump(matched[0] if len(matched) == 1 else matched, open(statement_path, "w"), indent=2, sort_keys=True)
-print(f"{digest}: provenance ok ({len(matched)} attestation(s), {run_uri})")
+print(
+    f"{digest}: provenance ok ({len(matched)} attestation(s) for {run_uri}, "
+    f"{len(skipped)} from other runs ignored)"
+)
 PY
 }
 
