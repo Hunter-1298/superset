@@ -1,0 +1,131 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+#
+# Operator-triggered negative test for the evidence half of the hardening loop.
+# It takes a real scan-evidence bundle produced by security-scan on `main`,
+# confirms the controller's intake accepts it untouched, then proves that intake
+# rejects the same bundle once it is tampered with or presented as evidence for
+# another commit, branch, repository or run. Nothing here builds images or runs
+# scanners; it costs one small runner job and no Devin ACUs.
+#
+# The mutation negatives (broken build, broken runtime, dependency regression,
+# scanner ignore files, unapproved VEX) open draft PRs against this repository
+# and are driven from the controller's `ci-negative` workflow instead, because
+# they need a token that may push branches here.
+name: evidence-negatives
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "security-scan run id whose scan-evidence bundle to use (default: latest successful push run on main)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  # Immutable controller pin; keep in step with security-scan.yml.
+  CONTROLLER_REF: f2e9529c8951a2f7351f86f44f55a62ece77d282
+
+jobs:
+  evidence-negatives:
+    name: evidence-negatives
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Checkout main with full history (baseline ancestry is answered from git)
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install hardening-loop CLI
+        uses: ./.github/actions/install-scanners
+        with:
+          controller-ref: ${{ env.CONTROLLER_REF }}
+          scanners: "false"
+
+      - name: Locate the security-scan run and its single evidence artifact
+        id: locate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID_INPUT: ${{ inputs.run_id }}
+        run: |
+          set -euo pipefail
+          if [ -n "$RUN_ID_INPUT" ]; then
+            RUN_ID="$RUN_ID_INPUT"
+          else
+            RUN_ID="$(gh run list --workflow security-scan --branch main --event push \
+              --status success --limit 1 --json databaseId --jq '.[0].databaseId')"
+          fi
+          if [ -z "$RUN_ID" ] || [ "$RUN_ID" = null ]; then
+            echo "::error::no successful security-scan push run on main to take evidence from"
+            exit 1
+          fi
+          RUN_JSON="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}")"
+          HEAD_SHA="$(jq -r .head_sha <<< "$RUN_JSON")"
+          ATTEMPT="$(jq -r .run_attempt <<< "$RUN_JSON")"
+          EVENT="$(jq -r .event <<< "$RUN_JSON")"
+          BRANCH="$(jq -r .head_branch <<< "$RUN_JSON")"
+          ARTS="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/artifacts" \
+            --jq '[.artifacts[] | select(.name | startswith("scan-evidence-")) | select(.expired | not) | .name]')"
+          COUNT="$(jq length <<< "$ARTS")"
+          if [ "$COUNT" -ne 1 ]; then
+            echo "::error::run ${RUN_ID} has ${COUNT} unexpired scan-evidence artifacts, expected exactly one"
+            exit 1
+          fi
+          {
+            echo "run_id=${RUN_ID}"
+            echo "head_sha=${HEAD_SHA}"
+            echo "attempt=${ATTEMPT}"
+            echo "event=${EVENT}"
+            echo "branch=${BRANCH}"
+            echo "artifact=$(jq -r '.[0]' <<< "$ARTS")"
+          } >> "$GITHUB_OUTPUT"
+          echo "using security-scan run ${RUN_ID} attempt ${ATTEMPT} (${EVENT} on ${BRANCH} @ ${HEAD_SHA})"
+
+      - name: Download the evidence bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: ${{ steps.locate.outputs.artifact }}
+          path: /tmp/bundle
+          run-id: ${{ steps.locate.outputs.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Accept the pristine bundle, reject every tampered or mis-attributed variant
+        env:
+          SOURCE_BRANCH: ${{ steps.locate.outputs.branch }}
+          EVENT: ${{ steps.locate.outputs.event }}
+          GIT_CHECKOUT: ${{ github.workspace }}
+          RUN_ID: ${{ steps.locate.outputs.run_id }}
+          ATTEMPT: ${{ steps.locate.outputs.attempt }}
+          HEAD_SHA: ${{ steps.locate.outputs.head_sha }}
+        run: scripts/ci/evidence_negatives.sh /tmp/bundle "$RUN_ID" "$ATTEMPT" "$HEAD_SHA" /tmp/verdicts
+
+      - name: Upload verdicts
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        with:
+          name: evidence-negatives-${{ steps.locate.outputs.run_id }}
+          path: /tmp/verdicts
+          if-no-files-found: error

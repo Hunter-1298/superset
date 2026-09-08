@@ -28,9 +28,10 @@ inputs:
     required: false
     default: "Hunter-1298/superset-hardening-loop"
   controller-ref:
-    description: "git ref of the controller to install"
-    required: false
-    default: "main"
+    description: >
+      controller commit to install. Must be a full 40-hex SHA except on
+      workflow_dispatch runs, where a branch or tag may be tried out.
+    required: true
   controller-path:
     description: "checkout path for the controller (relative to the workspace)"
     required: false
@@ -49,6 +50,21 @@ outputs:
 runs:
   using: composite
   steps:
+    - name: Refuse a mutable controller ref outside manual runs
+      shell: bash
+      env:
+        REF: ${{ inputs.controller-ref }}
+      run: |
+        set -euo pipefail
+        if [[ "$REF" =~ ^[0-9a-f]{40}$ ]]; then
+          exit 0
+        fi
+        if [ "$GITHUB_EVENT_NAME" != workflow_dispatch ]; then
+          echo "::error::controller-ref '${REF}' is not a commit SHA; ${GITHUB_EVENT_NAME} runs must use the committed pin"
+          exit 1
+        fi
+        echo "::warning::manual run installs the controller from mutable ref '${REF}'; its evidence is not reproducible"
+
     - name: Checkout hardening-loop controller (${{ inputs.controller-ref }})
       uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
       with:
@@ -106,8 +122,16 @@ runs:
     - name: Record controller checkout
       id: paths
       shell: bash
+      env:
+        REF: ${{ inputs.controller-ref }}
       run: |
         set -euo pipefail
         CONTROLLER="${GITHUB_WORKSPACE}/${{ inputs.controller-path }}"
+        SHA="$(git -C "${CONTROLLER}" rev-parse HEAD)"
+        if [[ "$REF" =~ ^[0-9a-f]{40}$ ]] && [ "$SHA" != "$REF" ]; then
+          echo "::error::checked out controller ${SHA}, expected pin ${REF}"
+          exit 1
+        fi
         echo "controller=${CONTROLLER}" >> "$GITHUB_OUTPUT"
-        echo "controller_sha=$(git -C "${CONTROLLER}" rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+        echo "controller_sha=${SHA}" >> "$GITHUB_OUTPUT"
+        echo "controller: ${SHA}" >> "$GITHUB_STEP_SUMMARY"

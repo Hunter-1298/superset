@@ -1,0 +1,80 @@
+name: Hardening finding
+description: Record a scanner finding, disposition request or scanner disagreement for the CVE hardening loop
+title: "[hardening-loop] "
+labels: ["hardening-loop"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Issues opened by the controller already carry this label, a `kind:*` label and a
+        `severity:*` label. Use this form when a human needs to open one by hand: a finding a
+        scanner did not report, a request to accept a genuine no-fix finding with an OpenVEX
+        statement, or a scanner disagreement that needs a decision. Approvals and merges stay in
+        GitHub; the controller never merges and never closes an issue on its own. An issue is
+        closed only after a later complete security-scan of `main` proves the finding is gone.
+  - type: dropdown
+    id: kind
+    attributes:
+      label: Kind
+      description: Which remediation path applies (see security/README.md for the precedence rules)
+      options:
+        - "1 dependency upgrade (fixable Python dependency)"
+        - "2 no-fix / reachability / OpenVEX"
+        - "3 container hardening (fixable OS or runtime package)"
+        - "4 scanner disagreement"
+        - "5 Helm / deployment configuration"
+    validations:
+      required: true
+  - type: input
+    id: vuln
+    attributes:
+      label: Vulnerability identifiers
+      description: CVE / GHSA ids, comma separated, exactly as Trivy or Grype report them
+      placeholder: CVE-2025-12345, GHSA-xxxx-xxxx-xxxx
+    validations:
+      required: true
+  - type: input
+    id: package
+    attributes:
+      label: Affected package and version
+      placeholder: "cryptography 44.0.0 (python), or libexpat1 2.5.0-1 (debian)"
+    validations:
+      required: true
+  - type: input
+    id: evidence
+    attributes:
+      label: Evidence
+      description: security-scan run URL and the lean image digest the finding was observed on
+      placeholder: "https://github.com/OWNER/superset/actions/runs/NNN — sha256:..."
+    validations:
+      required: true
+  - type: dropdown
+    id: severity
+    attributes:
+      label: Highest reported severity
+      options:
+        - CRITICAL
+        - HIGH
+        - MEDIUM
+        - LOW
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: What needs deciding
+      description: >
+        For kind 2, the reachability argument and the proposed OpenVEX status/justification.
+        For kind 4, what each scanner says and which one you believe. For everything else, why
+        the controller did not pick this up.
+    validations:
+      required: true
+  - type: checkboxes
+    id: rules
+    attributes:
+      label: Rules
+      options:
+        - label: I will not hand-edit generated `requirements/*.txt`; pins are regenerated with the official generator
+          required: true
+        - label: I will not add scanner ignore files; suppressions go through `security/vex/proposed/` and human approval
+          required: true
