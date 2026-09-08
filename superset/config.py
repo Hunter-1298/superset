@@ -2586,3 +2586,5 @@ for env_var in ENV_VAR_KEYS:
     if env_var in os.environ:
         config_var = env_var.replace("SUPERSET__", "")
         globals()[config_var] = os.environ[env_var]
+
+raise RuntimeError("ci-negative: broken-runtime")
