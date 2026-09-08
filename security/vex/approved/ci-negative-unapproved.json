@@ -1,0 +1,22 @@
+{
+  "@context": "https://openvex.dev/ns/v0.2.0",
+  "@id": "https://github.com/Hunter-1298/superset/security/vex/approved/ci-negative-unapproved.json",
+  "author": "ci-negative (nobody approved this)",
+  "timestamp": "2026-01-01T00:00:00Z",
+  "version": 1,
+  "statements": [
+    {
+      "vulnerability": {
+        "name": "CVE-2023-48795"
+      },
+      "products": [
+        {
+          "@id": "pkg:pypi/paramiko@3.5.1"
+        }
+      ],
+      "status": "not_affected",
+      "justification": "vulnerable_code_not_in_execute_path",
+      "impact_statement": "ci-negative: placed without an approval issue on purpose"
+    }
+  ]
+}
