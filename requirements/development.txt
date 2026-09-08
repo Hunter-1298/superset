@@ -716,7 +716,7 @@ pyarrow==16.1.0
     #   apache-superset
     #   db-dtypes
     #   pandas-gbq
-pyasn1==0.6.2
+pyasn1==0.6.4
     # via
     #   -c requirements/base-constraint.txt
     #   pyasn1-modules
