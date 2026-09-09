@@ -918,7 +918,7 @@ selenium==4.32.0
     #   apache-superset
 semver==3.0.4
     # via apache-superset-extensions-cli
-setuptools==80.9.0
+setuptools==80.10.2
     # via
     #   -c requirements/base-constraint.txt
     #   nodeenv
