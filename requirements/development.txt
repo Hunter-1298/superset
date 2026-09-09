@@ -178,7 +178,7 @@ croniter==6.0.0
     # via
     #   -c requirements/base-constraint.txt
     #   apache-superset
-cryptography==46.0.5
+cryptography==50.0.1
     # via
     #   -c requirements/base-constraint.txt
     #   apache-superset
@@ -778,7 +778,7 @@ pynacl==1.6.2
     # via
     #   -c requirements/base-constraint.txt
     #   paramiko
-pyopenssl==25.3.0
+pyopenssl==26.4.0
     # via
     #   -c requirements/base-constraint.txt
     #   shillelagh
